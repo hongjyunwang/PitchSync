@@ -18,6 +18,8 @@ warnings.filterwarnings("ignore")
 import matplotlib.pyplot as plt
 import requests
 
+import requests_cache
+
 def prep_train_data(df):
     '''
     Function to select and clean features and generate some new features
