@@ -35,7 +35,7 @@ prediction_service = PitchPredictionService()
 class PitchScenario(BaseModel):
     """Input model for pitch prediction"""
     pitcher: int = Field(..., description="Pitcher ID")
-    inning: int = Field(..., ge=1, le=20, description="Current inning")
+    inning: int = Field(..., ge=1, le=20, description="Current inning") 
     balls: int = Field(..., ge=0, le=3, description="Ball count")
     strikes: int = Field(..., ge=0, le=2, description="Strike count")
     outs_when_up: int = Field(..., ge=0, le=2, description="Number of outs")
