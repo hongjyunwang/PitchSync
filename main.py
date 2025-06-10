@@ -83,6 +83,7 @@ class PredictionResponse(BaseModel):
 
 class PitcherInfo(BaseModel):
     """Response model for pitcher information"""
+    pitcher_name: str
     pitcher_id: int
     model_accuracy: float
     naive_accuracy: float

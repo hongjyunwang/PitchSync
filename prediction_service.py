@@ -5,6 +5,8 @@ import os
 from typing import Dict, Any, Optional
 import logging
 
+from pybaseball import playerid_reverse_lookup
+
 logger = logging.getLogger(__name__)
 
 class PitchPredictionService:
@@ -190,7 +192,19 @@ class PitchPredictionService:
         if not model_data:
             return {"error": f"No model available for pitcher {pitcher_id}"}
         
+        try:
+            # Get name and additional info
+            player_info_df = playerid_reverse_lookup([pitcher_id])
+            if not player_info_df.empty:
+                name = player_info_df.iloc[0]['name_first'] + " " + player_info_df.iloc[0]['name_last']
+            else:
+                name = "Unknown"
+        except Exception as e:
+            logger.warning(f"Could not retrieve player name for ID {pitcher_id}: {e}")
+            name = "Unknown"
+        
         return {
+            "pitcher_name": name,
             "pitcher_id": pitcher_id,
             "model_accuracy": model_data.get('model_accuracy', 'N/A'),
             "naive_accuracy": model_data.get('naive_accuracy', 'N/A'),
