@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="MLB Pitch Prediction API",
     description="API for predicting MLB pitcher's next pitch type",
-    version="1.0.0"
+    version="2.0.0"  # Updated version for new training approach
 )
 
 # Add CORS middleware
@@ -56,33 +56,31 @@ class PitchScenario(BaseModel):
     # Pitcher info (optional)
     p_throws: Optional[str] = Field("R", description="Pitcher throws (L/R)")
     
-    # Previous pitch info (optional)
-    prev_type: Optional[str] = Field("UN", description="Previous pitch result")
-    prev_pfx_x: Optional[float] = Field(0.0, description="Previous pitch horizontal movement")
-    prev_pfx_z: Optional[float] = Field(0.0, description="Previous pitch vertical movement")
-    prev_plate_x: Optional[float] = Field(0.0, description="Previous pitch plate X location")
-    prev_plate_z: Optional[float] = Field(0.0, description="Previous pitch plate Z location")
-    prev_release_speed: Optional[float] = Field(0.0, description="Previous pitch velocity")
-    prev_release_spin_rate: Optional[float] = Field(0.0, description="Previous pitch spin rate")
-    prev_pitch_type: Optional[str] = Field("UN", description="Previous pitch type")
-    
     # Game info (optional)
     game_pk: Optional[int] = Field(12345, description="Game ID")
-    pitch_number: Optional[int] = Field(1, description="Pitch number in at-bat")
+    pitch_number_at_bat: Optional[int] = Field(1, description="Pitch number in at-bat")
+    inning_topbot: Optional[str] = Field("Bot", description="Top or Bot of inning")
 
 class PredictionResponse(BaseModel):
-    """Response model for pitch prediction"""
+    """Enhanced response model for pitch prediction"""
     pitcher_id: int
-    prediction: int
-    is_fastball: bool
-    probability_fastball: float
-    probability_offspeed: float
-    model_accuracy: float
+    prediction: int  # Backward compatibility (1 for fastball, 0 for offspeed)
+    is_fastball: bool  # Backward compatibility
+    predicted_pitch: str  # NEW: Specific pitch type
     confidence: float
+    pitch_probabilities: Dict[str, float]  # NEW: All pitch probabilities
+    pitch_arsenal: Dict[str, int]  # NEW: Pitcher's arsenal
+    filtered_pitches: List[str]  # NEW: Pitch types filtered out during training
+    top_3_predictions: Dict[str, float]  # NEW: Top 3 predictions
+    model_accuracy: float
+    total_pitch_types: int  # NEW: Number of pitch types
+    validation_method: str  # NEW: Validation method used during training
+    probability_fastball: float  # Backward compatibility
+    probability_offspeed: float  # Backward compatibility
     timestamp: datetime = Field(default_factory=datetime.now)
 
 class PitcherInfo(BaseModel):
-    """Response model for pitcher information"""
+    """Enhanced response model for pitcher information"""
     pitcher_name: str
     pitcher_id: int
     model_accuracy: float
@@ -90,6 +88,12 @@ class PitcherInfo(BaseModel):
     training_samples: int
     test_samples: int
     best_params: Dict[str, Any]
+    pitch_arsenal: Dict[str, int]  # Pitcher's arsenal
+    pitch_types: List[str]  # List of pitch types
+    filtered_pitches: List[str]  # NEW: Pitch types filtered during training
+    rare_pitch_threshold: int  # NEW: Threshold used for filtering
+    validation_method: str  # NEW: Validation method used
+    classification_report: Dict[str, Any]  # Detailed classification metrics
 
 class ErrorResponse(BaseModel):
     """Error response model"""
@@ -102,11 +106,20 @@ async def root():
     """Root endpoint"""
     return {
         "message": "MLB Pitch Prediction API",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "features": [
+            "Binary classification (fastball vs offspeed) - LEGACY",
+            "Multiclass classification (specific pitch types) - NEW", 
+            "Probability distribution for all pitch types - NEW",
+            "Pitcher arsenal analysis - NEW",
+            "Rare pitch filtering during training - NEW",
+            "Enhanced validation strategies - NEW"
+        ],
         "endpoints": {
             "predict": "/predict",
             "pitchers": "/pitchers",
             "pitcher_info": "/pitcher/{pitcher_id}",
+            "pitcher_arsenal": "/pitcher/{pitcher_id}/arsenal",
             "health": "/health",
             "docs": "/docs"
         }
@@ -194,13 +207,82 @@ async def predict_batch(scenarios: List[PitchScenario]):
         "failed": len(errors)
     }
 
+# Enhanced endpoints
+@app.get("/pitcher/{pitcher_id}/arsenal")
+async def get_pitcher_arsenal(pitcher_id: int):
+    """Get detailed information about a pitcher's arsenal"""
+    try:
+        info = prediction_service.get_pitcher_info(pitcher_id)
+        if "error" in info:
+            raise HTTPException(status_code=404, detail=info["error"])
+        
+        arsenal = info.get("pitch_arsenal", {})
+        total_pitches = sum(arsenal.values()) if arsenal else 0
+        filtered_pitches = info.get("filtered_pitches", [])
+        
+        # Calculate percentages
+        arsenal_percentages = {}
+        if total_pitches > 0:
+            for pitch_type, count in arsenal.items():
+                arsenal_percentages[pitch_type] = {
+                    "count": count,
+                    "percentage": round((count / total_pitches) * 100, 2)
+                }
+        
+        return {
+            "pitcher_id": pitcher_id,
+            "pitcher_name": info.get("pitcher_name", "Unknown"),
+            "total_pitches": total_pitches,
+            "arsenal": arsenal_percentages,
+            "pitch_types": list(arsenal.keys()),
+            "filtered_pitches": filtered_pitches,  # NEW: Show what was filtered
+            "rare_pitch_threshold": info.get("rare_pitch_threshold", 5),  # NEW
+            "primary_pitch": max(arsenal, key=arsenal.get) if arsenal else "Unknown",
+            "validation_method": info.get("validation_method", "N/A")  # NEW
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting pitcher arsenal: {e}")
+        raise HTTPException(status_code=500, detail="Error retrieving pitcher arsenal")
+
+@app.get("/pitcher/{pitcher_id}/training-details")
+async def get_pitcher_training_details(pitcher_id: int):
+    """Get detailed training information for a pitcher"""
+    try:
+        info = prediction_service.get_pitcher_info(pitcher_id)
+        if "error" in info:
+            raise HTTPException(status_code=404, detail=info["error"])
+        
+        return {
+            "pitcher_id": pitcher_id,
+            "pitcher_name": info.get("pitcher_name", "Unknown"),
+            "training_details": {
+                "model_accuracy": info.get("model_accuracy", "N/A"),
+                "naive_accuracy": info.get("naive_accuracy", "N/A"),
+                "improvement": round(float(info.get("model_accuracy", 0)) - float(info.get("naive_accuracy", 0)), 2) if info.get("model_accuracy", "N/A") != "N/A" else "N/A",
+                "training_samples": info.get("training_samples", "N/A"),
+                "test_samples": info.get("test_samples", "N/A"),
+                "validation_method": info.get("validation_method", "N/A"),
+                "best_params": info.get("best_params", {}),
+                "rare_pitch_threshold": info.get("rare_pitch_threshold", 5),
+                "filtered_pitches": info.get("filtered_pitches", [])
+            },
+            "classification_report": info.get("classification_report", {})
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting training details: {e}")
+        raise HTTPException(status_code=500, detail="Error retrieving training details")
+
 # Example usage endpoint
 @app.get("/example")
 async def get_example_request():
     """Get an example request for testing"""
     return {
         "example_request": {
-            "pitcher": 543037,  # Example pitcher ID
+            "pitcher": 621111,  # Use a pitcher ID from your trained models
             "inning": 3,
             "balls": 2,
             "strikes": 1,
@@ -210,15 +292,29 @@ async def get_example_request():
             "on_3b": None,
             "fld_score": 2,
             "bat_score": 1,
-            "batter": 67890,
             "stand": "L",
-            "p_throws": "R"
+            "p_throws": "R",
+            "inning_topbot": "Bot"
+        },
+        "enhanced_response_fields": {
+            "predicted_pitch": "Specific pitch type (FF, SL, CH, etc.)",
+            "pitch_probabilities": "Probabilities for all pitch types",
+            "pitch_arsenal": "Pitcher's complete arsenal with counts",
+            "filtered_pitches": "Pitch types filtered during training",
+            "validation_method": "Training validation approach used",
+            "top_3_predictions": "Top 3 most likely pitches"
+        },
+        "legacy_compatibility": {
+            "prediction": "1 for fastball, 0 for offspeed",
+            "is_fastball": "boolean",
+            "probability_fastball": "combined fastball probability",
+            "probability_offspeed": "combined offspeed probability"
         },
         "curl_example": """
 curl -X POST "http://localhost:8000/predict" \\
      -H "Content-Type: application/json" \\
      -d '{
-       "pitcher": 543037,
+       "pitcher": 621111,
        "inning": 3,
        "balls": 2,
        "strikes": 1,
@@ -227,7 +323,8 @@ curl -X POST "http://localhost:8000/predict" \\
        "fld_score": 2,
        "bat_score": 1,
        "stand": "L",
-       "p_throws": "R"
+       "p_throws": "R",
+       "inning_topbot": "Bot"
      }'
         """
     }
@@ -240,3 +337,4 @@ if __name__ == "__main__":
         reload=True,  # Enable auto-reload during development
         log_level="info"
     )
+    

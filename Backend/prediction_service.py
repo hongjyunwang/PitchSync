@@ -4,6 +4,7 @@ import numpy as np
 import os
 from typing import Dict, Any, Optional
 import logging
+from sklearn.preprocessing import LabelEncoder
 
 from pybaseball import playerid_reverse_lookup
 
@@ -13,7 +14,6 @@ class PitchPredictionService:
     def __init__(self, models_dir: str = "./models/pitcher_models/"):
         self.models_dir = models_dir
         self.loaded_models = {}
-        self.fastball_pitches = ['FA', 'FF', 'FT', 'FC', 'FS', 'SI', 'SF']
         
     def load_pitcher_model(self, pitcher_id: int) -> Optional[Dict[str, Any]]:
         """Load a specific pitcher's model"""
@@ -55,7 +55,7 @@ class PitchPredictionService:
         
         return sorted(pitcher_ids)
     
-    def preprocess_input(self, input_data: Dict[str, Any]) -> pd.DataFrame:
+    def preprocess_input(self, input_data: Dict[str, Any], feature_names: list) -> pd.DataFrame:
         """Preprocess input data to match training format"""
         # Convert to DataFrame if it's a dict
         if isinstance(input_data, dict):
@@ -63,83 +63,110 @@ class PitchPredictionService:
         else:
             df = input_data.copy()
         
-        # Map fastball pitches if pitch_type is present
-        if 'pitch_type' in df.columns:
-            df['pitch_type'] = df['pitch_type'].apply(self._map_fastballs)
+        # MATCH TRAINING PREPROCESSING EXACTLY
         
-        # Basic type casting
-        int_columns = ['game_pk', 'pitcher', 'batter', 'inning', 'balls', 'strikes', 
-                      'outs_when_up', 'pitch_number']
-        for col in int_columns:
-            if col in df.columns:
-                df[col] = df[col].astype('int64')
+        # Convert 'game_date' to datetime (if present)
+        if 'game_date' in df.columns:
+            df['game_date'] = pd.to_datetime(df['game_date'])
         
-        # Cap innings at 9
-        if 'inning' in df.columns:
-            df['inning'] = df['inning'].apply(lambda x: 9 if x > 9 else x)
+        # Inning breakdown
+        if 'inning_topbot' not in df.columns:
+            # Assume we're predicting for home team by default
+            df['inning_topbot'] = 'Bot'
+        df['home_team'] = df['inning_topbot'].map({'Top': 0, 'Bot': 1})
         
-        # Create game_pitcher_id
-        if 'game_pk' in df.columns and 'pitcher' in df.columns:
-            df['game_pitcher_id'] = df['game_pk'].astype(str) + '_' + df['pitcher'].astype(str)
+        # Count info
+        if 'balls' in df.columns and 'strikes' in df.columns:
+            df['balls'] = df['balls'].astype(int)
+            df['strikes'] = df['strikes'].astype(int)
+            df['count'] = df['balls'].astype(str) + '-' + df['strikes'].astype(str)
         
-        # Handle base runners
+        # Base runner info - encode as boolean (MATCH TRAINING)
         for base in ['on_1b', 'on_2b', 'on_3b']:
             if base in df.columns:
-                df[base] = df[base].apply(lambda x: not pd.isna(x) and x != 0)
-        
-        # Handle handedness
-        if 'p_throws' in df.columns and 'stand' in df.columns:
-            df['pitch_bat_same_side'] = df['p_throws'] == df['stand']
-            df.drop(['p_throws', 'stand'], axis=1, inplace=True)
-        
-        # Score differential
-        if 'fld_score' in df.columns and 'bat_score' in df.columns:
-            df['score_diff'] = df['fld_score'] - df['bat_score']
-            df.drop(['fld_score', 'bat_score'], axis=1, inplace=True)
-        
-        # Handle previous pitch features
-        prev_pitch_cols = ['prev_type', 'prev_pfx_x', 'prev_pfx_z', 'prev_plate_x', 
-                          'prev_plate_z', 'prev_release_speed', 'prev_release_spin_rate', 
-                          'prev_pitch_type']
-        
-        for col in prev_pitch_cols:
-            if col not in df.columns:
-                if col in ['prev_type', 'prev_pitch_type']:
-                    df[col] = 'UN'  # Unknown for categorical
-                else:
-                    df[col] = 0.0   # Zero for numerical
-        
-        # Fill missing values
-        for col in prev_pitch_cols:
-            if col in ['prev_type', 'prev_pitch_type']:
-                df[col].fillna('UN', inplace=True)
+                df[base] = ~pd.isna(df[base]) & (df[base] != 0)
             else:
-                df[col].fillna(0.0, inplace=True)
+                df[base] = False
         
-        # Add default fb_prob (ideally this would come from pre-computed lookup)
-        if 'fb_prob' not in df.columns:
-            df['fb_prob'] = 0.5
+        # Outs when up
+        if 'outs_when_up' in df.columns:
+            df['outs_when_up'] = df['outs_when_up'].astype(int)
+        else:
+            df['outs_when_up'] = 0
         
-        # One-hot encoding
-        cols_to_encode = ['inning', 'balls', 'strikes', 'outs_when_up', 'prev_type', 'prev_pitch_type']
+        # Score differential (MATCH TRAINING LOGIC)
+        if 'fld_score' in df.columns and 'bat_score' in df.columns:
+            # Assume we're predicting for home team (Bot inning)
+            if df['inning_topbot'].iloc[0] == 'Bot':
+                df['score_diff'] = df['fld_score'] - df['bat_score']  # Home team perspective
+            else:
+                df['score_diff'] = df['bat_score'] - df['fld_score']  # Away team perspective
+        else:
+            df['score_diff'] = 0
         
-        for col in cols_to_encode:
+        # Game state features (MATCH TRAINING)
+        if 'inning' in df.columns:
+            df['late_game'] = (df['inning'] >= 7).astype(int)
+        else:
+            df['inning'] = 1
+            df['late_game'] = 0
+        
+        df['runners_on'] = (df['on_1b'] | df['on_2b'] | df['on_3b']).astype(int)
+        df['scoring_position'] = (df['on_2b'] | df['on_3b']).astype(int)
+        df['two_out_scoring'] = ((df['outs_when_up'] == 2) & df['scoring_position']).astype(int)
+        
+        # Pitch number within at-bat (if not provided, assume 1)
+        if 'pitch_number_at_bat' not in df.columns:
+            df['pitch_number_at_bat'] = 1
+        
+        # Encode categorical variables (MATCH TRAINING)
+        categorical_columns = ['count', 'stand', 'p_throws']
+        
+        for col in categorical_columns:
             if col in df.columns:
-                # Get dummies and add to dataframe
-                dummies = pd.get_dummies(df[col], prefix=col)
-                df = pd.concat([df, dummies], axis=1)
-                df.drop(col, axis=1, inplace=True)
+                # Simple label encoding (same as training)
+                le = LabelEncoder()
+                unique_values = df[col].astype(str).unique()
+                le.fit(unique_values)
+                df[col + '_encoded'] = le.transform(df[col].astype(str))
+            else:
+                # Default values if missing
+                if col == 'count':
+                    df[col] = '0-0'
+                    df[col + '_encoded'] = 0
+                elif col == 'stand':
+                    df[col] = 'R'
+                    df[col + '_encoded'] = 0
+                elif col == 'p_throws':
+                    df[col] = 'R'
+                    df[col + '_encoded'] = 0
         
-        # Drop ID columns
-        id_cols = ['game_pk', 'batter', 'game_pitcher_id']
-        for col in id_cols:
-            if col in df.columns:
-                df.drop(col, axis=1, inplace=True)
+        # Create all required features with defaults
+        required_features = [
+            'inning', 'home_team', 'balls', 'strikes', 'on_3b', 'on_2b', 'on_1b',
+            'outs_when_up', 'score_diff', 'late_game', 'runners_on', 'scoring_position',
+            'two_out_scoring', 'pitch_number_at_bat', 'count_encoded', 'stand_encoded', 'p_throws_encoded'
+        ]
         
-        return df
+        for feature in required_features:
+            if feature not in df.columns:
+                df[feature] = 0  # Default value
+        
+        # Select only the features that were used in training
+        available_features = [col for col in feature_names if col in df.columns]
+        missing_features = [col for col in feature_names if col not in df.columns]
+        
+        if missing_features:
+            logger.warning(f"Missing features: {missing_features}")
+            # Add missing features with default values
+            for feature in missing_features:
+                df[feature] = 0
+        
+        # Return only the features used in training, in the same order
+        return df[feature_names]
     
     def predict(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Make prediction for a single pitch scenario"""
+        """Make prediction for a single pitch scenario - FIXED for new training approach"""
         try:
             # Extract pitcher ID
             pitcher_id = input_data.get('pitcher')
@@ -152,32 +179,52 @@ class PitchPredictionService:
                 return {"error": f"No model available for pitcher {pitcher_id}"}
             
             model = model_data['model']
+            label_encoder = model_data['label_encoder']  # NEW: Get the encoder
             feature_names = model_data['feature_names']
             
-            # Preprocess input
-            processed_df = self.preprocess_input(input_data)
+            # Preprocess input to match training format
+            processed_df = self.preprocess_input(input_data, feature_names)
             
-            # Ensure all required features are present
-            for feature in feature_names:
-                if feature not in processed_df.columns:
-                    processed_df[feature] = 0
+            # Make prediction - FIXED for new encoding approach
+            prediction_encoded = model.predict(processed_df)[0]  # Encoded prediction (integer)
+            probabilities = model.predict_proba(processed_df)[0]  # All probabilities
             
-            # Select only the features used in training
-            processed_df = processed_df[feature_names]
+            # Decode prediction back to string
+            prediction = label_encoder.inverse_transform([prediction_encoded])[0]
             
-            # Make prediction
-            prediction = model.predict(processed_df)[0] # Fastball or not
-            probabilities = model.predict_proba(processed_df)[0] # Specific probability of fastball or offspeed
+            # Get class labels (decode all classes)
+            classes_encoded = model.classes_  # [0, 1, 2, 3, ...]
+            classes = label_encoder.inverse_transform(classes_encoded)  # ['Fastball', 'Slider', ...]
             
-            # Format results
+            # Create probability dictionary
+            pitch_probabilities = {}
+            for i, pitch_type in enumerate(classes):
+                pitch_probabilities[pitch_type] = float(probabilities[i])
+            
+            # Sort probabilities by likelihood
+            sorted_probabilities = dict(sorted(pitch_probabilities.items(), 
+                                             key=lambda x: x[1], reverse=True))
+            
+            # Enhanced result format
             result = {
                 "pitcher_id": pitcher_id,
-                "prediction": int(prediction),
-                "is_fastball": bool(prediction == 1),
-                "probability_fastball": float(probabilities[1]) if len(probabilities) > 1 else float(probabilities[0]),
-                "probability_offspeed": float(probabilities[0]) if len(probabilities) > 1 else float(1 - probabilities[0]),
+                "prediction": int(prediction in ['Fastball', 'FF', 'FA', 'FT', 'SI']),  # Backward compatibility
+                "is_fastball": bool(prediction in ['Fastball', 'FF', 'FA', 'FT', 'SI']),  # Backward compatibility
+                "predicted_pitch": str(prediction),  # Specific pitch type
+                "confidence": float(max(probabilities)),
+                "pitch_probabilities": sorted_probabilities,  # All probabilities
+                "pitch_arsenal": model_data.get('pitch_arsenal', {}),  # Pitcher's arsenal
+                "filtered_pitches": model_data.get('filtered_pitches', []),  # NEW: Filtered out pitches
+                "top_3_predictions": dict(list(sorted_probabilities.items())[:3]),  # Top 3
                 "model_accuracy": model_data.get('model_accuracy', 'N/A'),
-                "confidence": float(max(probabilities))
+                "total_pitch_types": len(classes),  # Number of pitch types
+                "validation_method": model_data.get('validation_method', 'N/A'),  # NEW
+                
+                # Backward compatibility fields
+                "probability_fastball": float(sum(pitch_probabilities.get(p, 0.0) 
+                                                for p in ['Fastball', 'FF', 'FA', 'FT', 'SI'])),
+                "probability_offspeed": float(1.0 - sum(pitch_probabilities.get(p, 0.0) 
+                                                       for p in ['Fastball', 'FF', 'FA', 'FT', 'SI']))
             }
             
             return result
@@ -187,7 +234,7 @@ class PitchPredictionService:
             return {"error": f"Prediction failed: {str(e)}"}
     
     def get_pitcher_info(self, pitcher_id: int) -> Dict[str, Any]:
-        """Get information about a specific pitcher's model"""
+        """Get information about a specific pitcher's model - ENHANCED"""
         model_data = self.load_pitcher_model(pitcher_id)
         if not model_data:
             return {"error": f"No model available for pitcher {pitcher_id}"}
@@ -203,6 +250,7 @@ class PitchPredictionService:
             logger.warning(f"Could not retrieve player name for ID {pitcher_id}: {e}")
             name = "Unknown"
         
+        # Enhanced pitcher info (compatible with new training)
         return {
             "pitcher_name": name,
             "pitcher_id": pitcher_id,
@@ -210,10 +258,11 @@ class PitchPredictionService:
             "naive_accuracy": model_data.get('naive_accuracy', 'N/A'),
             "training_samples": model_data.get('training_samples', 'N/A'),
             "test_samples": model_data.get('test_samples', 'N/A'),
-            "best_params": model_data.get('best_params', {})
+            "best_params": model_data.get('best_params', {}),
+            "pitch_arsenal": model_data.get('pitch_arsenal', {}),
+            "pitch_types": model_data.get('pitch_types', []),
+            "filtered_pitches": model_data.get('filtered_pitches', []),  # NEW
+            "rare_pitch_threshold": model_data.get('rare_pitch_threshold', 5),  # NEW
+            "validation_method": model_data.get('validation_method', 'N/A'),  # NEW
+            "classification_report": model_data.get('classification_report', {})
         }
-    
-    def _map_fastballs(self, pitch_type):
-        """Map pitch types to fastball (1) or off-speed (0)"""
-        return 1 if pitch_type in self.fastball_pitches else 0
-    
