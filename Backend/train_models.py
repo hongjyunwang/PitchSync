@@ -6,13 +6,12 @@ warnings.filterwarnings('ignore')
 import numpy as np
 import pandas as pd
 from collections import Counter
-from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 import os
 from pybaseball import statcast
-
 
 
 class PitchTrainer:
@@ -105,7 +104,10 @@ class PitchTrainer:
         return data[available_columns]
     
     def load_and_clean_data(self, start_date='2024-03-20', end_date='2024-11-02'):
-        """Load and clean data from the specified date range"""
+        """
+        Load and clean play-level data from the specified date range
+        Uses statcast function to pull play-level data from Baseball Savant for a given date range.
+        """
         print(f"Loading data from {start_date} to {end_date}")
         
         # Download data
@@ -116,7 +118,7 @@ class PitchTrainer:
         clean_data = raw_data.dropna(subset=['pitch_type'])
         print(f"After dropping null pitch types: {clean_data.shape}")
         
-        # Filter out rare pitch types (less than 500 occurrences)
+        # Filter out rare pitch types (fewer than 500 occurrences)
         pitch_counts = clean_data['pitch_type'].value_counts()
         common_pitches = pitch_counts[pitch_counts >= 500].index
         clean_data = clean_data[clean_data['pitch_type'].isin(common_pitches)]
@@ -129,9 +131,6 @@ class PitchTrainer:
         """Train individual models for each pitcher, filtering out rare pitches per pitcher"""
         # Ensure directory exists
         os.makedirs('./Backend/models/pitcher_models/', exist_ok=True)
-        
-        # Import required modules
-        from sklearn.model_selection import StratifiedKFold
         
         # Get pitcher counts and filter out pitchers with too few pitches
         pitcher_count_dict = dict(Counter(data['pitcher']))
@@ -173,7 +172,7 @@ class PitchTrainer:
             
             print(f"Pitcher {pitcher}: Training on {len(common_pitches)} pitch types: {remaining_pitch_counts.to_dict()}")
             
-            # Use the filtered data
+            # Use the filtered data, drop the pitcher column since we know df_pitcher_filtered belongs to a single pitcher
             df_pitcher_filtered.drop('pitcher', axis=1, inplace=True)
             
             # Split features and target
@@ -189,7 +188,6 @@ class PitchTrainer:
                 X_train, X_test, y_train_encoded, y_test_encoded = train_test_split(
                     X, y_encoded, test_size=0.2, random_state=4256, stratify=y_encoded
                 )
-                split_method = "stratified"
             except ValueError as e:
                 print(f"Skipping pitcher {pitcher}: Stratified split failed - {str(e)[:50]}...")
                 continue
@@ -223,6 +221,9 @@ class PitchTrainer:
             else:
                 # Use default parameters for small/imbalanced datasets
                 use_cv = False
+
+            
+            # ---------------- XGBoost Process Begins ----------------
             
             # XGBoost hyperparameter grid
             xgb_params = {
